@@ -35,7 +35,7 @@ else:
         denoise, clahe = test4.denoise_contrast(img)
         
 
-        segmented = test4.k_cluster(clahe, test4.adaptive_threshold(denoise, clahe))
+        segmented = test4.k_cluster(clahe, test4.segment_regions(clahe))
         #segmented = test4.k_cluster(clahe, denoise)
 
         borderedImage = test4.draw_border(segmented)
