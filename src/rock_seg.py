@@ -81,87 +81,123 @@ def norm01(x):
     return (x - lo) / (hi - lo + 1e-8)
 
 
+# ---- Pipeline stages ----
+def load_image(img_path):
+    img = io.imread(str(img_path), as_gray=True)
+    img = np.asarray(img, dtype=np.float32)
+    if img.max() > 1.0:
+        img = img / 255.0
+    return img
+
+
+def denoise(img):
+    return restoration.denoise_nl_means(
+        img, h=0.06, fast_mode=True, patch_size=5, patch_distance=6
+    )
+
+
+def apply_clahe(denoised):
+    return exposure.equalize_adapthist(denoised, clip_limit=0.03)
+
+
+def apply_tophat(clahe):
+    return morphology.white_tophat(clahe, disk(TOPHAT_DISK))
+
+
+def build_binary_mask(clahe, tophat):
+    bw_clahe  = clahe  > threshold_sauvola(clahe,  window_size=SAUVOLA_WINDOW)
+    bw_tophat = tophat > threshold_sauvola(tophat, window_size=SAUVOLA_WINDOW)
+
+    ws_clahe  = watershed_separate(bw_clahe,  min_dist=WATERSHED_MIN_DIST)
+    ws_tophat = watershed_separate(bw_tophat, min_dist=WATERSHED_MIN_DIST)
+
+    bw = clean_binary_mask(ws_clahe | ws_tophat,
+                           min_size=MIN_OBJECT_SIZE,
+                           max_hole_size=MAX_HOLE_SIZE)
+    return bw_clahe, bw_tophat, ws_clahe, ws_tophat, bw
+
+
+def run_kmeans(clahe):
+    lbp  = compute_lbp(clahe, P=8 * 3, R=3)
+    feat = np.stack([norm01(clahe).ravel(), norm01(lbp).ravel()], axis=1)
+    km   = KMeans(n_clusters=2, random_state=0, n_init=10)
+    km.fit(feat)
+    km_seg = km.labels_.reshape(clahe.shape)
+    return lbp, km_seg
+
+
+def select_foreground(km_seg, bw):
+    overlap_scores = [
+        float(np.logical_and(km_seg == i, bw).sum()) / ((km_seg == i).sum() + 1e-8)
+        for i in range(2)
+    ]
+    fg_cluster = int(np.argmax(overlap_scores))
+    return (km_seg == fg_cluster) & bw
+
+
+def build_final_mask(bw, cluster_foreground_raw):
+    final_mask = np.zeros_like(bw, dtype=bool)
+    for lab in np.unique(bw):
+        if lab == 0:
+            continue
+        region_mask = bw == lab
+        fg_ratio = (
+            float(np.logical_and(region_mask, cluster_foreground_raw).sum())
+            / region_mask.sum()
+        )
+        if fg_ratio >= FG_RATIO_THRESHOLD:
+            final_mask[region_mask] = True
+    return morphology.remove_small_objects(final_mask, min_size=MIN_OBJECT_SIZE)
+
+
+def save_mask(final_mask, base_name):
+    mask_save_path = masks_folder / f"{base_name}_mask.png"
+    io.imsave(str(mask_save_path), (final_mask.astype(np.uint8) * 255))
+    print(f"  Mask saved → {mask_save_path}")
+
+
+def save_debug_images(base_name, img, denoised, clahe, tophat,
+                      bw_clahe, bw_tophat, bw, ws_clahe, ws_tophat,
+                      lbp, km_seg, cluster_foreground_raw, final_mask):
+    show_image(img,                    "01 Original",            f"{base_name}_01_original.png")
+    show_image(denoised,               "02 Denoised",            f"{base_name}_02_denoised.png")
+    show_image(clahe,                  "03 CLAHE",               f"{base_name}_03_clahe.png")
+    show_image(tophat,                 "04 Top-hat",             f"{base_name}_04_tophat.png")
+    show_image(bw_clahe,               "05a Binary (CLAHE)",     f"{base_name}_05a_bw_clahe.png")
+    show_image(bw_tophat,              "05b Binary (tophat)",    f"{base_name}_05b_bw_tophat.png")
+    show_image(bw,                     "05c Binary (combined)",  f"{base_name}_05c_bw_combined.png")
+    show_image(ws_clahe,               "06 Watershed (CLAHE)",   f"{base_name}_06_watershed_clahe.png",
+               cmap="nipy_spectral")
+    show_image(ws_tophat,              "06 Watershed (Top-hat)", f"{base_name}_06_watershed_tophat.png",
+               cmap="nipy_spectral")
+    show_image(lbp,                    "07 LBP texture",         f"{base_name}_07_lbp.png")
+    show_image(km_seg,                 "08 KMeans classes",      f"{base_name}_08_kmeans.png")
+    show_image(cluster_foreground_raw, "09 Foreground (KMeans)", f"{base_name}_09_foreground_raw.png")
+    show_image(final_mask,             "10 Final mask",          f"{base_name}_10_final_mask.png")
+
+
+def process_image(img_path):
+    print(f"\nProcessing: {img_path.name}")
+    base_name = img_path.stem
+
+    img                   = load_image(img_path)
+    denoised              = denoise(img)
+    clahe                 = apply_clahe(denoised)
+    tophat                = apply_tophat(clahe)
+    bw_clahe, bw_tophat, ws_clahe, ws_tophat, bw = build_binary_mask(clahe, tophat)
+    lbp, km_seg           = run_kmeans(clahe)
+    cluster_foreground_raw = select_foreground(km_seg, bw)
+    final_mask            = build_final_mask(bw, cluster_foreground_raw)
+
+    save_mask(final_mask, base_name)
+    save_debug_images(base_name, img, denoised, clahe, tophat,
+                      bw_clahe, bw_tophat, bw, ws_clahe, ws_tophat,
+                      lbp, km_seg, cluster_foreground_raw, final_mask)
+
+
 # ---- Main ----
 if not image_files:
     print("No images found in 'images' folder")
 else:
     for img_path in image_files:
-        print(f"\nProcessing: {img_path.name}")
-        base_name = img_path.stem
-
-        # Load
-        img = io.imread(str(img_path), as_gray=True)
-        img = np.asarray(img, dtype=np.float32)
-        if img.max() > 1.0:
-            img = img / 255.0
-
-        # Denoise
-        denoised = restoration.denoise_nl_means(
-            img, h=0.06, fast_mode=True, patch_size=5, patch_distance=6
-        )
-
-        # CLAHE
-        clahe = exposure.equalize_adapthist(denoised, clip_limit=0.03)
-
-        # Top-hat
-        tophat = morphology.white_tophat(clahe, disk(TOPHAT_DISK))
-
-        # Binary mask — threshold CLAHE and tophat separately, then union
-        bw_clahe  = clahe  > threshold_sauvola(clahe,  window_size=SAUVOLA_WINDOW)
-        bw_tophat = tophat > threshold_sauvola(tophat, window_size=SAUVOLA_WINDOW)
-        bw = clean_binary_mask(bw_clahe | bw_tophat,
-                               min_size=MIN_OBJECT_SIZE,
-                               max_hole_size=MAX_HOLE_SIZE)
-
-        # Watershed separation
-        ws_labels = watershed_separate(bw, min_dist=WATERSHED_MIN_DIST)
-
-        # LBP + KMeans
-        lbp    = compute_lbp(clahe, P=8 * 3, R=3)
-        feat   = np.stack([norm01(clahe).ravel(), norm01(lbp).ravel()], axis=1)
-        kmeans = KMeans(n_clusters=2, random_state=0, n_init=10)
-        kmeans.fit(feat)
-        km_seg = kmeans.labels_.reshape(clahe.shape)
-
-        # Select foreground cluster by overlap with binary mask (not brightness)
-        overlap_scores = [
-            float(np.logical_and(km_seg == i, bw).sum()) / ((km_seg == i).sum() + 1e-8)
-            for i in range(2)
-        ]
-        fg_cluster            = int(np.argmax(overlap_scores))
-        cluster_foreground_raw = (km_seg == fg_cluster) & bw
-
-        # Final mask — keep watershed regions where KMeans agrees
-        final_mask = np.zeros_like(bw, dtype=bool)
-        for lab in np.unique(ws_labels):
-            if lab == 0:
-                continue
-            region_mask = ws_labels == lab
-            fg_ratio = (
-                float(np.logical_and(region_mask, cluster_foreground_raw).sum())
-                / region_mask.sum()
-            )
-            if fg_ratio >= FG_RATIO_THRESHOLD:
-                final_mask[region_mask] = True
-
-        final_mask = morphology.remove_small_objects(final_mask, min_size=MIN_OBJECT_SIZE)
-
-        # Save final mask for rock_measurements.py
-        mask_save_path = masks_folder / f"{base_name}_mask.png"
-        io.imsave(str(mask_save_path), (final_mask.astype(np.uint8) * 255))
-        print(f"  Mask saved → {mask_save_path}")
-
-        # Debug visualisations
-        show_image(img,                    "01 Original",            f"{base_name}_01_original.png")
-        show_image(denoised,               "02 Denoised",            f"{base_name}_02_denoised.png")
-        show_image(clahe,                  "03 CLAHE",               f"{base_name}_03_clahe.png")
-        show_image(tophat,                 "04 Top-hat",             f"{base_name}_04_tophat.png")
-        show_image(bw_clahe,               "05a Binary (CLAHE)",     f"{base_name}_05a_bw_clahe.png")
-        show_image(bw_tophat,              "05b Binary (tophat)",    f"{base_name}_05b_bw_tophat.png")
-        show_image(bw,                     "05c Binary (combined)",  f"{base_name}_05c_bw_combined.png")
-        show_image(ws_labels,              "06 Watershed",           f"{base_name}_06_watershed.png",
-                   cmap="nipy_spectral")
-        show_image(lbp,                    "07 LBP texture",         f"{base_name}_07_lbp.png")
-        show_image(km_seg,                 "08 KMeans classes",      f"{base_name}_08_kmeans.png")
-        show_image(cluster_foreground_raw, "09 Foreground (KMeans)", f"{base_name}_09_foreground_raw.png")
-        show_image(final_mask,             "10 Final mask",          f"{base_name}_10_final_mask.png")
+        process_image(img_path)
