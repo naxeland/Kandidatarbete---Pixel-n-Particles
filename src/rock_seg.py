@@ -10,14 +10,18 @@ Loads rock images, runs the full segmentation pipeline, and saves:
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
-from skimage import io, exposure, morphology, restoration, segmentation, measure
+from skimage import io, exposure, morphology, restoration, segmentation
 from skimage.filters import threshold_sauvola
 from skimage.morphology import disk
-from skimage.feature import peak_local_max
 from scipy import ndimage as ndi
 from sklearn.cluster import KMeans
 from skimage.feature import local_binary_pattern
 from skimage.util import img_as_ubyte
+import time
+
+# ---- Time ----
+start = time.time()
+
 
 # ---- Folders ----
 image_folder  = Path("images")
@@ -30,12 +34,14 @@ image_files = list(image_folder.glob("*.jpg")) + list(image_folder.glob("*.png")
 
 # ---- Settings ----
 # Tune TOPHAT_DISK to be clearly larger than your largest rock radius in pixels.
-TOPHAT_DISK        = 60
-MIN_OBJECT_SIZE    = 200
-MAX_HOLE_SIZE      = 2000
-SAUVOLA_WINDOW     = 51
-WATERSHED_MIN_DIST = 12    # roughly the smallest rock radius you care about
-FG_RATIO_THRESHOLD = 0.4   # fraction of a watershed region that must be KMeans-foreground
+TOPHAT_DISK           = 10 
+MIN_OBJECT_SIZE       = 200
+MAX_HOLE_SIZE         = 2000
+SAUVOLA_WINDOW        = 51
+FELZENSZWALB_SCALE    = 200   # higher = larger segments
+FELZENSZWALB_SIGMA    = 0.8   # Gaussian smoothing before segmentation
+FELZENSZWALB_MIN_SIZE = 50    # minimum segment size in pixels
+FG_RATIO_THRESHOLD    = 0.4   # fraction of a Felzenszwalb region that must be KMeans-foreground
 
 
 # ---- Helpers ----
@@ -64,16 +70,14 @@ def clean_binary_mask(mask, min_size=200, max_hole_size=2000):
     return mask
 
 
-def watershed_separate(binary_mask, min_dist=12):
-    distance        = ndi.distance_transform_edt(binary_mask)
-    distance_smooth = ndi.gaussian_filter(distance, sigma=2)
-    coords          = peak_local_max(distance_smooth, min_distance=min_dist,
-                                     labels=binary_mask)
-    markers = np.zeros(binary_mask.shape, dtype=bool)
-    if len(coords):
-        markers[tuple(coords.T)] = True
-    markers = measure.label(markers)
-    return segmentation.watershed(-distance_smooth, markers, mask=binary_mask)
+def felzenszwalb_separate(image, binary_mask,
+                          scale=FELZENSZWALB_SCALE,
+                          sigma=FELZENSZWALB_SIGMA,
+                          min_size=FELZENSZWALB_MIN_SIZE):
+    labels = segmentation.felzenszwalb(image, scale=scale, sigma=sigma, min_size=min_size)
+    labels = labels + 1          # shift so 0 can serve as background
+    labels[~binary_mask] = 0
+    return labels
 
 
 def norm01(x):
@@ -108,13 +112,13 @@ def build_binary_mask(clahe, tophat):
     bw_clahe  = clahe  > threshold_sauvola(clahe,  window_size=SAUVOLA_WINDOW)
     bw_tophat = tophat > threshold_sauvola(tophat, window_size=SAUVOLA_WINDOW)
 
-    ws_clahe  = watershed_separate(bw_clahe,  min_dist=WATERSHED_MIN_DIST)
-    ws_tophat = watershed_separate(bw_tophat, min_dist=WATERSHED_MIN_DIST)
+    fz_clahe  = felzenszwalb_separate(clahe,  bw_clahe)
+    fz_tophat = felzenszwalb_separate(tophat, bw_tophat)
 
-    bw = clean_binary_mask(ws_clahe | ws_tophat,
+    bw = clean_binary_mask(fz_clahe | fz_tophat,
                            min_size=MIN_OBJECT_SIZE,
                            max_hole_size=MAX_HOLE_SIZE)
-    return bw_clahe, bw_tophat, ws_clahe, ws_tophat, bw
+    return bw_clahe, bw_tophat, fz_clahe, fz_tophat, bw
 
 
 def run_kmeans(clahe):
@@ -157,47 +161,70 @@ def save_mask(final_mask, base_name):
 
 
 def save_debug_images(base_name, img, denoised, clahe, tophat,
-                      bw_clahe, bw_tophat, bw, ws_clahe, ws_tophat,
+                      bw_clahe, bw_tophat, bw, fz_clahe, fz_tophat,
                       lbp, km_seg, cluster_foreground_raw, final_mask):
-    show_image(img,                    "01 Original",            f"{base_name}_01_original.png")
-    show_image(denoised,               "02 Denoised",            f"{base_name}_02_denoised.png")
-    show_image(clahe,                  "03 CLAHE",               f"{base_name}_03_clahe.png")
-    show_image(tophat,                 "04 Top-hat",             f"{base_name}_04_tophat.png")
-    show_image(bw_clahe,               "05a Binary (CLAHE)",     f"{base_name}_05a_bw_clahe.png")
-    show_image(bw_tophat,              "05b Binary (tophat)",    f"{base_name}_05b_bw_tophat.png")
-    show_image(bw,                     "05c Binary (combined)",  f"{base_name}_05c_bw_combined.png")
-    show_image(ws_clahe,               "06 Watershed (CLAHE)",   f"{base_name}_06_watershed_clahe.png",
+    show_image(img,                    "01 Original",                  f"{base_name}_01_original.png")
+    show_image(denoised,               "02 Denoised",                  f"{base_name}_02_denoised.png")
+    show_image(clahe,                  "03 CLAHE",                     f"{base_name}_03_clahe.png")
+    show_image(tophat,                 "04 Top-hat",                   f"{base_name}_04_tophat.png")
+    show_image(bw_clahe,               "05a Binary (CLAHE)",           f"{base_name}_05a_bw_clahe.png")
+    show_image(bw_tophat,              "05b Binary (tophat)",          f"{base_name}_05b_bw_tophat.png")
+    show_image(bw,                     "05c Binary (combined)",        f"{base_name}_05c_bw_combined.png")
+    show_image(fz_clahe,               "06 Felzenszwalb (CLAHE)",      f"{base_name}_06_felzenszwalb_clahe.png",
                cmap="nipy_spectral")
-    show_image(ws_tophat,              "06 Watershed (Top-hat)", f"{base_name}_06_watershed_tophat.png",
+    show_image(fz_tophat,              "06 Felzenszwalb (Top-hat)",    f"{base_name}_06_felzenszwalb_tophat.png",
                cmap="nipy_spectral")
-    show_image(lbp,                    "07 LBP texture",         f"{base_name}_07_lbp.png")
-    show_image(km_seg,                 "08 KMeans classes",      f"{base_name}_08_kmeans.png")
-    show_image(cluster_foreground_raw, "09 Foreground (KMeans)", f"{base_name}_09_foreground_raw.png")
-    show_image(final_mask,             "10 Final mask",          f"{base_name}_10_final_mask.png")
+    show_image(lbp,                    "07 LBP texture",               f"{base_name}_07_lbp.png")
+    show_image(km_seg,                 "08 KMeans classes",            f"{base_name}_08_kmeans.png")
+    show_image(cluster_foreground_raw, "09 Foreground (KMeans)",       f"{base_name}_09_foreground_raw.png")
+    show_image(final_mask,             "10 Final mask",                f"{base_name}_10_final_mask.png")
 
 
 def process_image(img_path):
     print(f"\nProcessing: {img_path.name}")
     base_name = img_path.stem
 
+    t0 = time.time()
     img                   = load_image(img_path)
+    t1 = time.time(); print(f"img Runtime: {t1-t0:.4f}s")
     denoised              = denoise(img)
+    t2 = time.time(); print(f"denoised Runtime: {t2-t1:.4f}s")
     clahe                 = apply_clahe(denoised)
+    t3 = time.time(); print(f"CLAHE Runtime: {t3-t2:.4f}s")
     tophat                = apply_tophat(clahe)
-    bw_clahe, bw_tophat, ws_clahe, ws_tophat, bw = build_binary_mask(clahe, tophat)
+    t4 = time.time(); print(f"tophat Runtime: {t4-t3:.4f}s")
     lbp, km_seg           = run_kmeans(clahe)
+    t5 = time.time(); print(f"KMeans Runtime: {t5-t4:.4f}s")
+    bw_clahe, bw_tophat, fz_clahe, fz_tophat, bw = build_binary_mask(clahe, tophat)
+    t6 = time.time(); print(f"Binary mask Runtime: {t6-t5:.4f}s")
     cluster_foreground_raw = select_foreground(km_seg, bw)
+    t7 = time.time(); print(f"Foreground selection Runtime: {t7-t6:.4f}s")
     final_mask            = build_final_mask(bw, cluster_foreground_raw)
+    t8 = time.time(); print(f"Final mask Runtime: {t8-t7:.4f}s")
+    print(f"Total Runtime: {t8-t0:.4f}s")
+    '''
+    show_image(km_seg, "KMeans segmentation", f"{base_name}_kmeans.png", cmap="nipy_spectral")
+    show_image(lbp, "LBP texture", f"{base_name}_lbp.png")
+    show_image(cluster_foreground_raw, "Foreground (KMeans)", f"{base_name}_binary_mask.png")
+    '''
+    save_mask(cluster_foreground_raw, base_name)
 
-    save_mask(final_mask, base_name)
     save_debug_images(base_name, img, denoised, clahe, tophat,
-                      bw_clahe, bw_tophat, bw, ws_clahe, ws_tophat,
+                      bw_clahe, bw_tophat, bw, fz_clahe, fz_tophat,
                       lbp, km_seg, cluster_foreground_raw, final_mask)
 
+def move_files(image, src_folder, dst_folder):
+    src = Path(src_folder) / image
+    src.rename(Path(dst_folder) / image)
 
 # ---- Main ----
-if not image_files:
-    print("No images found in 'images' folder")
-else:
-    for img_path in image_files:
-        process_image(img_path)
+while(1):
+    if not image_files:
+        print("No images found in 'images' folder")
+    else:
+        for img_path in image_files:
+            process_image(img_path)
+            move_files(img_path.name, "images", "images2")
+    time.sleep(5)  # Check for new images every 5 seconds
+        
+        

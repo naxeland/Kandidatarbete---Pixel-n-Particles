@@ -9,7 +9,6 @@ from scipy import ndimage as ndi
 from sklearn.cluster import KMeans
 from skimage.feature import local_binary_pattern
 from skimage.util import img_as_ubyte
-#from img_split import get_middle_fifth
 
 # ---- Folders ----
 image_folder = Path("images")
@@ -120,7 +119,6 @@ else:
 
         # ---- Load ----
         img = io.imread(str(img_path), as_gray=True)
-        #img = get_middle_fifth(img)
         img = np.asarray(img, dtype=np.float32)
         if img.max() > 1.0:
             img = img / 255.0

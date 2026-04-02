@@ -75,4 +75,5 @@ else:
 
         print(f"  Objects detected : {len(diameters)}")
         print(f"  Diameters (px)   : {np.sort(np.array(diameters)).round(1).tolist()}")
+        print(f"  Areas (px^2)    : {np.sort(np.array(areas)).round(1).tolist()}")
         print(f"  Results saved    → {results_folder / base_name}_*.csv")
