@@ -158,10 +158,29 @@ def select_foreground(km_seg, bw):
     return (km_seg == fg_cluster) & bw
 
 
-def fill_rock_interiors(mask, closing_radius=1.85, max_hole_size=5000):
+def detect_container_roi(img, closing_radius=30):
+    """Find the bright interior of the container, masking out the dark rubber rim.
+    Uses a global Otsu threshold on the original image (before CLAHE) so the
+    dark rubber — which is much darker than any rock — is cleanly excluded.
+    """
+    from skimage.filters import threshold_otsu
+    thresh = threshold_otsu(img)
+    roi = img > thresh
+    # Keep only the largest connected bright region (the rock heap)
+    labeled, _ = ndi.label(roi)
+    component_sizes = np.bincount(labeled.ravel())
+    component_sizes[0] = 0  # ignore the background label
+    largest_label = int(component_sizes.argmax())
+    roi = labeled == largest_label
+    roi = ndi.binary_fill_holes(roi)
+    roi = morphology.closing(roi, disk(closing_radius))
+    return roi
+
+
+def fill_rock_interiors(mask, closing_radius=1, max_hole_size=1000):
     """Close small gaps within rocks, then fill enclosed holes."""
     filled = morphology.closing(mask, disk(closing_radius))
-    filled = ndi.binary_fill_holes(filled)
+    #filled = ndi.binary_fill_holes(filled)
     filled = morphology.remove_small_holes(filled, area_threshold=max_hole_size)
     return filled
 
@@ -211,7 +230,8 @@ def process_image(img_path):
     bw_clahe, bw_tophat, bw = build_binary_mask(clahe, tophat)
     t6 = time.time(); print(f"Binary mask Runtime: {t6-t5:.4f}s")
     bright_mask            = denoised > WALL_BRIGHTNESS_THRESH
-    bw                     = bw & bright_mask
+    container_roi          = detect_container_roi(img)
+    bw                     = bw & bright_mask & container_roi
     cluster_foreground_raw = select_foreground(km_seg, bw)
     cluster_foreground_raw = fill_rock_interiors(cluster_foreground_raw)
     t7 = time.time(); print(f"Foreground selection Runtime: {t7-t6:.4f}s")
