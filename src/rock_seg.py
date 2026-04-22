@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from skimage import io, exposure, morphology, restoration, segmentation
 from skimage.color import rgb2hsv
-from skimage.filters import threshold_sauvola
+from skimage.filters import threshold_sauvola, sobel
 from skimage.morphology import disk
 from scipy import ndimage as ndi
 from sklearn.cluster import KMeans
@@ -69,14 +69,32 @@ def clean_binary_mask(mask, min_size=200, max_hole_size=2000):
     return mask
 
 
-def watershed_label(binary_mask, min_distance=None):
+def watershed_label(binary_mask, clahe_img=None, min_distance=None):
+    distance = ndi.distance_transform_edt(binary_mask)
+    if clahe_img is not None:
+        distance += (clahe_img * 0.1)  # small boost from CLAHE intensity
     if min_distance is None:
         min_distance = WATERSHED_MIN_DISTANCE
-    distance = ndi.distance_transform_edt(binary_mask)
+
+    # peak_local_max returns coordinates (indices=False was removed in newer skimage)
     coords = peak_local_max(distance, min_distance=min_distance, labels=binary_mask)
-    markers = np.zeros(binary_mask.shape, dtype=int)
-    markers[tuple(coords.T)] = np.arange(1, len(coords) + 1)
-    return segmentation.watershed(-distance, markers, mask=binary_mask)
+    local_maxi = np.zeros(binary_mask.shape, dtype=bool)
+    if len(coords):
+        local_maxi[tuple(coords.T)] = True
+    markers, _ = ndi.label(local_maxi)
+
+    # Guarantee every connected component has at least one marker so no rock is dropped
+    component_labels, _ = ndi.label(binary_mask)
+    next_marker = int(markers.max()) + 1
+    for comp_id in range(1, int(component_labels.max()) + 1):
+        comp_mask = component_labels == comp_id
+        if not np.any(markers[comp_mask]):
+            peak_idx = np.unravel_index((distance * comp_mask).argmax(), distance.shape)
+            markers[peak_idx] = next_marker
+            next_marker += 1
+
+    labeled = segmentation.watershed(-distance, markers, mask=binary_mask)
+    return labeled
 
 
 
@@ -194,7 +212,6 @@ def save_mask(final_mask, base_name):
 def save_debug_images(base_name, img, denoised, clahe, tophat,
                       bw_clahe, bw_tophat, bw,
                       lbp, km_seg, cluster_foreground_raw, labeled_rocks, final_mask):
-    '''
     show_image(img,                    "01 Original",                  f"{base_name}_01_original.png")
     show_image(denoised,               "02 Denoised",                  f"{base_name}_02_denoised.png")
     show_image(clahe,                  "03 CLAHE",                     f"{base_name}_03_clahe.png")
@@ -204,7 +221,7 @@ def save_debug_images(base_name, img, denoised, clahe, tophat,
     show_image(bw,                     "05c Binary (combined)",        f"{base_name}_05c_bw_combined.png")
     show_image(lbp,                    "07 LBP texture",               f"{base_name}_07_lbp.png")
     show_image(km_seg,                 "08 KMeans classes",            f"{base_name}_08_kmeans.png")
-    '''
+    
     show_image(cluster_foreground_raw, "09 Foreground (KMeans)",       f"{base_name}_09_foreground_raw.png")
     show_image(labeled_rocks,          "10 Watershed labels",          f"{base_name}_10_watershed.png",
                cmap="nipy_spectral")
@@ -231,11 +248,12 @@ def process_image(img_path):
     t6 = time.time(); print(f"Binary mask Runtime: {t6-t5:.4f}s")
     bright_mask            = denoised > WALL_BRIGHTNESS_THRESH
     container_roi          = detect_container_roi(img)
+    container_roi          = morphology.erosion(container_roi, disk(5))
     bw                     = bw & bright_mask & container_roi
     cluster_foreground_raw = select_foreground(km_seg, bw)
     cluster_foreground_raw = fill_rock_interiors(cluster_foreground_raw)
     t7 = time.time(); print(f"Foreground selection Runtime: {t7-t6:.4f}s")
-    labeled_rocks = watershed_label(cluster_foreground_raw)
+    labeled_rocks = watershed_label(cluster_foreground_raw, clahe_img=clahe)
     final_mask    = labeled_rocks > 0
     t8 = time.time(); print(f"Final mask Runtime: {t8-t7:.4f}s")
     print(f"Total Runtime: {t8-t0:.4f}s")
