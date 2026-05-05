@@ -278,7 +278,7 @@ def process_image(img_path):
     #show_image(final_mask,             "mask",     f"{base_name}_11_final_mask.png")
     '''
     tophat_img = tophat if USE_TOPHAT else np.zeros_like(clahe)
-    bw_tophat_img = bw_tophat if USE_TOPHAT else np.zeros_like(bw_clahe)
+    bw_tophat_img = bw_tphat if USE_TOPHAT else np.zeros_like(bw_clahe)
     save_debug_images(base_name, img, denoised, clahe, tophat_img,
                       bw_clahe, bw_tophat_img, bw,
                       lbp, km_seg, cluster_foreground_raw, labeled_rocks, final_mask)
