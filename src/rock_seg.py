@@ -33,13 +33,15 @@ masks_folder.mkdir(exist_ok=True)
 
 # ---- Settings ----
 # Tune TOPHAT_DISK to be clearly larger than your largest rock radius in pixels.
-TOPHAT_DISK            = 80
+TOPHAT_DISK            = 100
 USE_TOPHAT             = True   # set True to re-enable (slow)
 MIN_OBJECT_SIZE        = 100
 MAX_HOLE_SIZE          = 3000
 SAUVOLA_WINDOW         = 61    # must be odd, should be larger than largest rock radius in pixels
-WATERSHED_MIN_DISTANCE = 18    # minimum pixel distance between rock centers for watershed
+WATERSHED_MIN_DISTANCE = 1    # minimum pixel distance between rock centers for watershed
 WALL_BRIGHTNESS_THRESH = 0.15  # pixels darker than this are treated as wall/background
+TOP_ROCK_MIN_INTENSITY = 0.5   # watershed regions with mean intensity below this are dropped as non-top rocks
+MIN_ROCK_AREA          = 500   # watershed regions smaller than this (px) are dropped as rubble
 status = False # set to False to disable infinite loop and just process existing images once
 
 
@@ -69,32 +71,16 @@ def clean_binary_mask(mask, min_size=200, max_hole_size=2000):
     return mask
 
 
-def watershed_label(binary_mask, clahe_img=None, min_distance=None):
-    distance = ndi.distance_transform_edt(binary_mask)
-    if clahe_img is not None:
-        distance += (clahe_img * 0.1)  # small boost from CLAHE intensity
+def watershed_label(binary_mask, min_distance=None):
     if min_distance is None:
         min_distance = WATERSHED_MIN_DISTANCE
-
-    # peak_local_max returns coordinates (indices=False was removed in newer skimage)
+    distance = ndi.distance_transform_edt(binary_mask)
     coords = peak_local_max(distance, min_distance=min_distance, labels=binary_mask)
     local_maxi = np.zeros(binary_mask.shape, dtype=bool)
     if len(coords):
         local_maxi[tuple(coords.T)] = True
     markers, _ = ndi.label(local_maxi)
-
-    # Guarantee every connected component has at least one marker so no rock is dropped
-    component_labels, _ = ndi.label(binary_mask)
-    next_marker = int(markers.max()) + 1
-    for comp_id in range(1, int(component_labels.max()) + 1):
-        comp_mask = component_labels == comp_id
-        if not np.any(markers[comp_mask]):
-            peak_idx = np.unravel_index((distance * comp_mask).argmax(), distance.shape)
-            markers[peak_idx] = next_marker
-            next_marker += 1
-
-    labeled = segmentation.watershed(-distance, markers, mask=binary_mask)
-    return labeled
+    return segmentation.watershed(-distance, markers, mask=binary_mask)
 
 
 
@@ -129,20 +115,26 @@ def apply_clahe(denoised):
     return exposure.equalize_adapthist(denoised, clip_limit=0.03)
 
 
-def apply_tophat(clahe, downsample=4):
+def apply_tophat(img, downsample=4):
     from skimage.transform import resize
-    h, w = clahe.shape
-    small = resize(clahe, (h // downsample, w // downsample), anti_aliasing=True)
+    h, w = img.shape
+    small = resize(img, (h // downsample, w // downsample), anti_aliasing=True)
     th_small = morphology.white_tophat(small, disk(max(1, TOPHAT_DISK // downsample)))
-    return resize(th_small, (h, w), anti_aliasing=True).astype(np.float32)
+    return resize(th_small, (h, w), anti_aliasing=False).astype(np.float32)
 
+def tophat_(denoised):
+    selem_bg = disk(TOPHAT_DISK)
+    tophat = morphology.white_tophat(denoised, selem_bg)
+    return tophat
 
 def build_binary_mask(clahe, tophat):
     bw_clahe = clahe > threshold_sauvola(clahe, window_size=SAUVOLA_WINDOW)
+    ws_clahe = watershed_label(bw_clahe, min_distance=WATERSHED_MIN_DISTANCE)
 
     if USE_TOPHAT and tophat is not None:
         bw_tophat = tophat > threshold_sauvola(tophat, window_size=SAUVOLA_WINDOW)
-        combined  = bw_clahe | bw_tophat
+        ws_tophat = watershed_label(bw_tophat, min_distance=WATERSHED_MIN_DISTANCE)
+        combined  = ws_clahe | ws_tophat
     else:
         bw_tophat = np.zeros_like(bw_clahe)
         combined  = bw_clahe
@@ -153,13 +145,15 @@ def build_binary_mask(clahe, tophat):
     return bw_clahe, bw_tophat, bw
 
 
-def run_kmeans(clahe, img_color=None):
+def run_kmeans(clahe):#, img_color=None):
     lbp      = compute_lbp(clahe, P=8 * 3, R=3)
     features = [norm01(clahe).ravel(), norm01(lbp).ravel()]
+    '''
     if img_color is not None:
         hsv = rgb2hsv(img_color)
         features.append(norm01(hsv[:, :, 0]).ravel())  # Hue
         features.append(norm01(hsv[:, :, 1]).ravel())  # Saturation
+    '''
     feat   = np.stack(features, axis=1)
     km     = KMeans(n_clusters=2, random_state=0, n_init=10)
     km.fit(feat)
@@ -193,6 +187,19 @@ def detect_container_roi(img, closing_radius=30):
     roi = ndi.binary_fill_holes(roi)
     roi = morphology.closing(roi, disk(closing_radius))
     return roi
+
+
+def filter_top_rocks(labeled, intensity_img, min_intensity=None, min_area=None):
+    if min_intensity is None:
+        min_intensity = TOP_ROCK_MIN_INTENSITY
+    if min_area is None:
+        min_area = MIN_ROCK_AREA
+    filtered = np.zeros_like(labeled)
+    for label_id in range(1, int(labeled.max()) + 1):
+        region_mask = labeled == label_id
+        if region_mask.sum() >= min_area and float(intensity_img[region_mask].mean()) >= min_intensity:
+            filtered[region_mask] = label_id
+    return filtered
 
 
 def fill_rock_interiors(mask, closing_radius=1, max_hole_size=1000):
@@ -234,42 +241,62 @@ def process_image(img_path):
 
     t0 = time.time()
     img                   = load_image(img_path)
-    img_color             = load_image_color(img_path)
     t1 = time.time(); print(f"img Runtime: {t1-t0:.4f}s")
     denoised              = denoise(img)
     t2 = time.time(); print(f"denoised Runtime: {t2-t1:.4f}s")
     clahe                 = apply_clahe(denoised)
     t3 = time.time(); print(f"CLAHE Runtime: {t3-t2:.4f}s")
-    tophat                = apply_tophat(clahe) if USE_TOPHAT else None
+    #tophat                = apply_tophat(denoised)
+    tophat               = tophat_(denoised)
     t4 = time.time(); print(f"tophat Runtime: {t4-t3:.4f}s")
-    lbp, km_seg           = run_kmeans(clahe, img_color)
+    lbp, km_seg           = run_kmeans(clahe) 
     t5 = time.time(); print(f"KMeans Runtime: {t5-t4:.4f}s")
     bw_clahe, bw_tophat, bw = build_binary_mask(clahe, tophat)
     t6 = time.time(); print(f"Binary mask Runtime: {t6-t5:.4f}s")
+    '''
     bright_mask            = denoised > WALL_BRIGHTNESS_THRESH
     container_roi          = detect_container_roi(img)
     container_roi          = morphology.erosion(container_roi, disk(5))
-    bw                     = bw & bright_mask & container_roi
-    cluster_foreground_raw = select_foreground(km_seg, bw)
-    cluster_foreground_raw = fill_rock_interiors(cluster_foreground_raw)
+    '''
+    #bw                     = bw & bright_mask & container_roi
+    cluster_ws = watershed_label(km_seg, min_distance=WATERSHED_MIN_DISTANCE)
+    #bw_ws = watershed_label(bw, min_distance=WATERSHED_MIN_DISTANCE)
+    cluster_foreground = select_foreground(cluster_ws > 0, bw)
+    #cluster_foreground_raw = fill_rock_interiors(cluster_foreground)
     t7 = time.time(); print(f"Foreground selection Runtime: {t7-t6:.4f}s")
-    labeled_rocks = watershed_label(cluster_foreground_raw, clahe_img=clahe)
-    final_mask    = labeled_rocks > 0
+    #labeled_rocks = watershed_label(cluster_foreground_raw, min_distance=WATERSHED_MIN_DISTANCE)
+    #labeled_rocks = filter_top_rocks(labeled_rocks, denoised)
+    #final_mask    = labeled_rocks > 0
     t8 = time.time(); print(f"Final mask Runtime: {t8-t7:.4f}s")
     print(f"Total Runtime: {t8-t0:.4f}s")
 
-    save_mask(final_mask, base_name)
-    save_mask(cluster_foreground_raw, base_name)
+    save_mask(cluster_foreground, base_name)
 
+    show_image(km_seg,                 "08 KMeans classes",            f"{base_name}_08_kmeans.png")
+    #show_image(labeled_rocks, "Watershedding", f"{base_name}_09_foreground.png")
+    show_image(cluster_foreground, "Cluster foreground", f"{base_name}_bw_tophat.png")
+    #show_image(final_mask,             "mask",     f"{base_name}_11_final_mask.png")
+    '''
     tophat_img = tophat if USE_TOPHAT else np.zeros_like(clahe)
     bw_tophat_img = bw_tophat if USE_TOPHAT else np.zeros_like(bw_clahe)
     save_debug_images(base_name, img, denoised, clahe, tophat_img,
                       bw_clahe, bw_tophat_img, bw,
                       lbp, km_seg, cluster_foreground_raw, labeled_rocks, final_mask)
+'''
 
 def move_files(image, src_folder, dst_folder):
     src = Path(src_folder) / image
     src.rename(Path(dst_folder) / image)
+
+
+def remove_image(img_path):
+    """Delete an image file from the images folder after it has been processed."""
+    try:
+        Path(img_path).unlink()
+        print(f"  Removed: {img_path}")
+    except FileNotFoundError:
+        print(f"  [warn] File already gone: {img_path}")
+
 
 # ---- Main ----
 image_files = list(image_folder.glob("*.jpg")) + list(image_folder.glob("*.png"))
@@ -280,7 +307,7 @@ if status:
         else:
             for img_path in image_files:
                 process_image(img_path)
-                #move_files(img_path.name, "images", "images2")
+                #remove_image(img_path)
         time.sleep(5)  # Check for new images every 5 seconds
 else:
     if not image_files:
@@ -288,7 +315,7 @@ else:
     else:
         for img_path in image_files:
             process_image(img_path)
-            #move_files(img_path.name, "images", "images2")
+            #remove_image(img_path)
     time.sleep(5)  # Check for new images every 5 seconds
         
         
